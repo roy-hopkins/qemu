@@ -370,6 +370,7 @@ have_vhost_net_kernel = have_vhost_kernel and get_option('vhost_net').allowed()
 have_vhost_net = have_vhost_net_kernel or have_vhost_net_user or have_vhost_net_vdpa
 
 # Target-specific libraries and flags
+kbs = cc.find_library('kbs_client', required: true)
 libm = cc.find_library('m', required: false)
 threads = dependency('threads')
 util = cc.find_library('util', required: false)
@@ -3437,6 +3438,9 @@ foreach target : target_dirs
             '-DCONFIG_TARGET="@0@-config-target.h"'.format(target),
             '-DCONFIG_DEVICES="@0@-config-devices.h"'.format(target)]
   link_args = emulator_link_args
+
+  kbs = dependency('kbs_client', required: true, method: 'pkg-config', kwargs: static_kwargs)
+  arch_deps += kbs
 
   config_target += config_host
   target_inc = [include_directories('target' / config_target['TARGET_BASE_ARCH'])]

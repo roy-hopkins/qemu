@@ -61,6 +61,7 @@
 #include "migration/blocker.h"
 #include "exec/memattrs.h"
 #include "trace.h"
+#include "monitor/monitor.h"
 
 #include CONFIG_DEVICES
 
@@ -5153,6 +5154,85 @@ static int kvm_handle_tpr_access(X86CPU *cpu)
     return 1;
 }
 
+#define KVM_HC_KEY_EXCHANGE 13
+
+
+uintptr_t get_svsm_secret(const uint8_t *url,
+                          uintptr_t url_len,
+                          const uint8_t *path,
+                          uintptr_t path_len,
+                          const uint8_t *evidence,
+                          uintptr_t evidence_len,
+                          const uint8_t *tee_key,
+                          uintptr_t tee_key_len,
+                          const uint8_t *certs,
+                          uintptr_t certs_len,
+                          uint8_t *resource_buf,
+                          uintptr_t resource_buf_len);
+
+
+static int kvm_handle_get_secret(const unsigned char* evidence, uint64_t evidence_length, 
+                                 const unsigned char* certs, uint64_t certs_length, 
+                                 unsigned char* buf, uint64_t buf_length) {
+    unsigned char url[4096];
+    unsigned char path[4096];
+    unsigned char tee_public_key[4096];
+    unsigned char tee_private_key[4096];
+
+    uint64_t len = 0;
+
+    strcpy((char*)url, "http://127.0.0.1:8080");
+    strcpy((char*)path, "default/test/dummy");
+    strcpy((char*)tee_public_key, 
+    "-----BEGIN PUBLIC KEY-----\n" \
+    "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA98vy6jyjQ4htkgwt7lJy\n" \
+    "fMWweyRUZLk/8+9pcw57Ax46aF7ugkJEug2LUBRxK5lfAlZdSkHOEAGRJoOnv+1/\n" \
+    "oVvQ20YsKfVbwYNAO30TdNOhHFnXRbSo+LsfTluJf5ofbJoaZj6dTNbqFVWM9Pr0\n" \
+    "5Q65l/Eqn95jJ2NUzyUVFrNY/fXjkOexjx6/abYo/jjjIu+oR6xZctFbmkse/tEo\n" \
+    "+raSCmxUc9LXJUBUtv8ik88lVJEK86iwch3UU+cNLWHgvJE0xg3C4t3gtVZwOCOf\n" \
+    "faISJdbI1NsO6PUGt3j/3ZC1Ss7NP/RUr+sgmMQroiLVTeMm0f3tFDZ6RYLXIpdi\n" \
+    "hwIDAQAB\n" \
+    "-----END PUBLIC KEY-----\n");
+    strcpy((char*)tee_private_key,
+        "-----BEGIN RSA PRIVATE KEY-----\n" \
+        "MIIEpQIBAAKCAQEA98vy6jyjQ4htkgwt7lJyfMWweyRUZLk/8+9pcw57Ax46aF7u\n" \
+        "gkJEug2LUBRxK5lfAlZdSkHOEAGRJoOnv+1/oVvQ20YsKfVbwYNAO30TdNOhHFnX\n" \
+        "RbSo+LsfTluJf5ofbJoaZj6dTNbqFVWM9Pr05Q65l/Eqn95jJ2NUzyUVFrNY/fXj\n" \
+        "kOexjx6/abYo/jjjIu+oR6xZctFbmkse/tEo+raSCmxUc9LXJUBUtv8ik88lVJEK\n" \
+        "86iwch3UU+cNLWHgvJE0xg3C4t3gtVZwOCOffaISJdbI1NsO6PUGt3j/3ZC1Ss7N\n" \
+        "P/RUr+sgmMQroiLVTeMm0f3tFDZ6RYLXIpdihwIDAQABAoIBAQDMQSPxqpwVPa67\n" \
+        "1ShDK1jNupKXXsHl6MFrjKwKOCRz1IXmpGHLo15NUn7EOqVyf9DN92ycmhOGJBSG\n" \
+        "f71VuiobUridFoGu8F167HqUzqusAAnsea21+o3RwUSz7UYwlVVTys75+qDkxr5b\n" \
+        "aZJwGTCmYvXe5d7xunlW7UzqFrIEa6An6FPsQRbbL+dIUAK6/2MqYpmxlUyXUm1l\n" \
+        "QYAR83VnYWzpOfRsSe2CJCVEuVvIrRBY6Dz1ge9cE+yo30ChuvMyHA0C41KKyyLp\n" \
+        "f58WDKzkd83x3OhcrRfYaGBnXoGYEU8GpdmFhlSZqSF6NN96DGDvnvnL/zU2QVgt\n" \
+        "uw7cCIwRAoGBAP/wM2Qhl860kCrilMnbmpCa/HJT78E1kY4BhmbK1BIoL6wmCbHx\n" \
+        "EY1S6hiDianDwqmeXuaiFHfDMukgSk3RIDgN5Ff/TP9m9oMcOIRc4IuRTcJ+bpuW\n" \
+        "AQ+yIn0mR6J5pwmAgvVSsFFUpNxToUhBnxbKYyxoOpMIJ5V3k2Bv1IafAoGBAPfb\n" \
+        "PtyKuzPkbxe8yGOeQXe34Cj2P5O17g73c71dyH/6sdS/mkQyMS3wCE1SwZ5uDcbg\n" \
+        "IKpa2BLWn5+nsl5jbayVCCqKv1qnf5g5iRfs0Odhr1HZgKW4QVXqJpZdBwhLwRxC\n" \
+        "OWFCIDXMIykHfutJXttP3E3cSvHhEuCLNyCRgaMZAoGBAKzZp4uXmHQUxE0CS6Rs\n" \
+        "eN3ynk4EXCbrq8rxQrkHgORmWZP0+JVBjy4X8lvt8jpCKKTvfX5btmEP5sFFeolF\n" \
+        "lHHnB/FaTcEr4462r4DNTSVVU+PoCYFwdHUKRHqrMLQNXv9u2IMgfk3fUZwvqvwm\n" \
+        "vW/h7cqe9fg5CKrMYC9AN5NXAoGAc2AYq/rcV7SPTiJvuYeSfBMZAphWUgEPNuJT\n" \
+        "eyPr0D83hoxGWFZw9CxXAP9z57bdLOVp70LocCR+G4ipjCyGgh7BtWPu3Vk5GPg3\n" \
+        "a+6t8/dR8CzqKLpTl5WurrHRMzhoRSpCoZZxfflvqIq3tvjpcfeD2q6gKGYYLnQ/\n" \
+        "jiaNjQkCgYEA/PsWy4zjUn+O2aIZaZf0Gm60azSkm1hAbB90EHDxyOSyLrUUv1IQ\n" \
+        "8QL/oPd77TYO1YLqQYXkVY3PK4NsGIowT7SnKfWwu0Bv3ZvcWmdY/dlnv/qJTd/k\n" \
+        "F4J/GXM3xNqmBTR7kBAGhIh/pCe0p+4IyhFEGNLGYOhFh0XToF8zno4=\n" \
+        "-----END RSA PRIVATE KEY-----");
+
+    memset(buf, 0, buf_length);
+
+    len = get_svsm_secret(url, strlen((char*)url), 
+                     path, strlen((char*)path), 
+                     evidence, evidence_length,
+                     tee_private_key, strlen((char*)tee_private_key), 
+                     certs, certs_length,
+                     buf, buf_length);
+    return len;
+}
+
 static int kvm_handle_exit_hypercall(X86CPU *cpu, struct kvm_run *run)
 {
     /*
@@ -5166,6 +5246,26 @@ static int kvm_handle_exit_hypercall(X86CPU *cpu, struct kvm_run *run)
 
         trace_kvm_hc_map_range(gpa, npages, enc);
         kvm_convert_memory(gpa, npages * 4096, enc);
+    }
+    else if (run->hypercall.nr == KVM_HC_KEY_EXCHANGE) {
+        unsigned long report_gpa = run->hypercall.args[0];
+        unsigned long report_len = run->hypercall.args[1];
+        MemoryRegion *mr = NULL;
+        unsigned char* hva = (unsigned char*)gpa2hva(&mr, report_gpa, report_len, NULL);
+        if (hva) {
+            int len;
+            unsigned char buf[4096];
+            printf("** Got report from guest\n");
+
+            len = kvm_handle_get_secret(hva + 32, report_len - 32, hva + 4096, 4096 * 3, buf, sizeof(buf));
+            if (len == 0) {
+                printf("** Failed to get key from KBS\n");
+            }
+            else {
+                printf("** Get key from KBS: len=%d\n", len);
+                memcpy(hva, buf, len);
+            }
+        }
     }
     return 0;
 }
