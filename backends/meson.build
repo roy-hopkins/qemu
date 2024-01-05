@@ -28,6 +28,7 @@ softmmu_ss.add(when: gio, if_true: files('dbus-vmstate.c'))
 softmmu_ss.add(when: 'CONFIG_SGX', if_true: files('hostmem-epc.c'))
 if igvm.found()
   softmmu_ss.add(igvm)
+  softmmu_ss.add(files('igvm.c'))
 endif
 
 subdir('tpm')
