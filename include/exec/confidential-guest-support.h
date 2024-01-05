@@ -21,9 +21,32 @@
 #ifndef CONFIG_USER_ONLY
 
 #include "qom/object.h"
+#include "exec/hwaddr.h"
+
+#if defined(CONFIG_IGVM)
+#include "igvm/igvm.h"
+#endif
 
 #define TYPE_CONFIDENTIAL_GUEST_SUPPORT "confidential-guest-support"
 OBJECT_DECLARE_SIMPLE_TYPE(ConfidentialGuestSupport, CONFIDENTIAL_GUEST_SUPPORT)
+
+typedef enum ConfidentialGuestPlatformType {
+    CGS_SEV_SNP
+} ConfidentialGuestPlatformType;
+
+typedef enum ConfidentialGuestMemoryType {
+    CGS_MEM_RAM,
+    CGS_MEM_RESERVED,
+    CGS_MEM_ACPI,
+    CGS_MEM_NVS,
+    CGS_MEM_UNUSABLE,
+} ConfidentialGuestMemoryType;
+
+typedef struct ConfidentialGuestMemoryMapEntry {
+    uint64_t gpa;
+    uint64_t size;
+    ConfidentialGuestMemoryType type;
+} ConfidentialGuestMemoryMapEntry;
 
 struct ConfidentialGuestSupport {
     Object parent;
@@ -60,6 +83,47 @@ struct ConfidentialGuestSupport {
      */
     char *igvm_filename;
 #endif
+
+    /*
+     * The following virtual methods need to be implemented by systems that
+     * support confidential guests that can be configured with IGVM and are
+     * used during processing of the IGVM file with process_igvm().
+     */
+
+    /*
+     * Check for to see if this confidential guest supports a particular
+     * platform or configuration
+     */
+    int (*check_support)(ConfidentialGuestPlatformType platform,
+                         uint16_t platform_version, uint8_t highest_vtl,
+                         uint64_t shared_gpa_boundary);
+
+    /* 
+     * Configure an area of guest memory, populating the guest memory with
+     * with the data in the provided pointer at the requested guest physical
+     * address. Memory type is one of KVM_SEV_SNP_PAGE_TYPE_*.
+     */
+    int (*set_memory_attributes)(hwaddr gpa, uint8_t *ptr, uint64_t len,
+                                 int memory_type);
+
+    /*
+     * Set the initial context for a virtual CPU. The format of the context pointed
+     * to by ctx depends on the type of confidential virtual machine. For example,
+     * for SEV-SNP, ctx points to a vmcb_save_area structure.
+     */
+    int (*set_cpu_context)(uint16_t cpu_index, const void *ctx,
+                           uint32_t ctx_len);
+
+    /*
+     * Get the number of entries that should be populated into the guest memory map.
+     */
+    int (*get_mem_map_count)(void);
+
+    /*
+     * Get an entry that should be populated in the guest memory map.
+     */
+    void (*get_mem_map_entry)(int index,
+                              ConfidentialGuestMemoryMapEntry *entry);
 };
 
 typedef struct ConfidentialGuestSupportClass {
