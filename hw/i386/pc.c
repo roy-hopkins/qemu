@@ -101,6 +101,7 @@
 #include "fw_cfg.h"
 #include "trace.h"
 #include CONFIG_DEVICES
+#include "exec/confidential-guest-support.h"
 
 #ifdef CONFIG_XEN_EMU
 #include "hw/xen/xen-legacy-backend.h"
@@ -1098,12 +1099,26 @@ void pc_memory_init(PCMachineState *pcms,
         }
     }
 
-    /* Initialize PC system firmware */
-    pc_system_firmware_init(pcms, rom_memory);
+    /* 
+     * If this is a confidential guest configured using IGVM then the IGVM 
+     * configuration will include the system firmware. In this case do not 
+     * initialise PC system firmware.
+     */
+    if (!cgs_is_igvm(machine->cgs)) {
+        /* Initialize PC system firmware */
+        pc_system_firmware_init(pcms, rom_memory);
+    }
+    else {
+        /*
+         * The flash devices were created when the PC was initialized. We can clean
+         * the devices up here as they will not be used.
+         */ 
+         pc_system_flash_cleanup_unused(pcms);
+    }
 
     option_rom_mr = g_malloc(sizeof(*option_rom_mr));
     memory_region_init_ram(option_rom_mr, NULL, "pc.rom", PC_ROM_SIZE,
-                           &error_fatal);
+                        &error_fatal);
     if (pcmc->pci_enabled) {
         memory_region_set_readonly(option_rom_mr, true);
     }
@@ -1135,7 +1150,7 @@ void pc_memory_init(PCMachineState *pcms,
 
     if (linux_boot) {
         x86_load_linux(x86ms, fw_cfg, pcmc->acpi_data_size,
-                       pcmc->pvh_enabled);
+                    pcmc->pvh_enabled);
     }
 
     for (i = 0; i < nb_option_roms; i++) {
