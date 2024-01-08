@@ -76,6 +76,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(SevGuestState, SEV_GUEST)
 #define TYPE_SEV_SNP_GUEST "sev-snp-guest"
 OBJECT_DECLARE_SIMPLE_TYPE(SevSnpGuestState, SEV_SNP_GUEST)
 
+typedef struct SevLaunchVmsa {
+    QTAILQ_ENTRY(SevLaunchVmsa) next;
+
+    uint16_t cpu_index;
+    struct vmcb_save_area vmsa;
+} SevLaunchVmsa;
+
 /**
  * SevGuestState:
  *
@@ -103,9 +110,7 @@ struct SevCommonState {
     int sev_fd;
     SevState state;
 
-    uint32_t reset_cs;
-    uint32_t reset_ip;
-    bool reset_data_valid;
+    QTAILQ_HEAD(, SevLaunchVmsa) launch_vmsa;
 };
 
 struct SevGuestState {
@@ -442,6 +447,38 @@ sev_common_class_init(ObjectClass *oc, void *data)
     object_class_property_add_str(oc, "discard",
                                   sev_common_get_discard,
                                   sev_common_set_discard);
+}
+
+static int sev_set_cpu_context(uint16_t cpu_index, const void *ctx,
+                               uint32_t ctx_len)
+{
+    SevCommonState *sev_common = SEV_COMMON(MACHINE(qdev_get_machine())->cgs);
+    SevLaunchVmsa *vmsa;
+
+    if (ctx_len < sizeof(struct vmcb_save_area)) {
+        error_report("invalid VP context");
+        exit(1);
+    }
+
+    /* 
+     * If the context of this VP has already been set then replace it with the 
+     * new context
+     */
+    QTAILQ_FOREACH(vmsa, &sev_common->launch_vmsa, next)
+    {
+        if (cpu_index == vmsa->cpu_index) {
+            memcpy(&vmsa->vmsa, ctx, sizeof(vmsa->vmsa));
+            return 0;
+        }
+    }
+
+    // New VP context
+    vmsa = g_new0(SevLaunchVmsa, 1);
+    memcpy(&vmsa->vmsa, ctx, sizeof(vmsa->vmsa));
+    vmsa->cpu_index = cpu_index;
+    QTAILQ_INSERT_TAIL(&sev_common->launch_vmsa, vmsa, next);
+
+    return 0;
 }
 
 static void
@@ -1639,7 +1676,7 @@ sev_snp_launch_finish(SevSnpGuestState *sev_snp)
 
     /* Populate all the metadata pages */
     snp_populate_metadata_pages(sev_snp, metadata);
-
+    
     QTAILQ_FOREACH(data, &launch_update, next) {
         ret = sev_snp_launch_update(sev_snp, data);
         if (ret) {
@@ -2032,30 +2069,77 @@ sev_es_find_reset_vector(void *flash_ptr, uint64_t flash_size,
     return sev_es_parse_reset_block(info, addr);
 }
 
-void sev_es_set_reset_vector(CPUState *cpu)
+static void sev_es_set_vmsa(uint32_t reset_addr)
 {
+    CPUState *cpu;
+    struct vmcb_save_area vmsa;
+    memset(&vmsa, 0, sizeof(struct vmcb_save_area));
+
+    vmsa.cs.selector = 0xf000;
+    vmsa.cs.base = reset_addr & 0xffff0000;
+    vmsa.cs.limit = 0xffff;
+    vmsa.cs.attrib = (DESC_P_MASK | DESC_S_MASK | DESC_CS_MASK |
+	                  DESC_R_MASK | DESC_B_MASK | DESC_G_MASK  |
+	                  DESC_A_MASK) >> 8;
+
+    vmsa.rip = reset_addr & 0x0000ffff;
+
+    CPU_FOREACH(cpu) {
+        sev_set_cpu_context(cpu->cpu_index, &vmsa,
+                            sizeof(struct vmcb_save_area));
+    }
+}
+
+static void sev_apply_cpu_context(CPUState *cpu) {
+    SevCommonState *sev_common = SEV_COMMON(MACHINE(qdev_get_machine())->cgs);
     X86CPU *x86;
     CPUX86State *env;
-    SevCommonState *sev_common = SEV_COMMON(MACHINE(qdev_get_machine())->cgs);
+    struct SevLaunchVmsa *vmsa;
 
-    /* Only update if we have valid reset information */
-    if (!sev_common || !sev_common->reset_data_valid) {
-        return;
+    QTAILQ_FOREACH(vmsa, &sev_common->launch_vmsa, next) {
+        if (cpu->cpu_index == vmsa->cpu_index) {
+            x86 = X86_CPU(cpu);
+            env = &x86->env;
+
+            cpu_load_efer(env, vmsa->vmsa.efer);
+            cpu_x86_update_cr4(env, vmsa->vmsa.cr4);
+            cpu_x86_update_cr0(env, vmsa->vmsa.cr0);
+            cpu_x86_update_cr3(env, vmsa->vmsa.cr3);
+
+            cpu_x86_load_seg_cache(env, R_CS, vmsa->vmsa.cs.selector,
+                                   vmsa->vmsa.cs.base, vmsa->vmsa.cs.limit,
+                                   ((vmsa->vmsa.cs.attrib & 0xff00) << 12) |
+                                       ((vmsa->vmsa.cs.attrib & 0xff) << 8));
+            cpu_x86_load_seg_cache(env, R_DS, vmsa->vmsa.ds.selector,
+                                   vmsa->vmsa.ds.base, vmsa->vmsa.ds.limit,
+                                   ((vmsa->vmsa.ds.attrib & 0xff00) << 12) |
+                                       ((vmsa->vmsa.ds.attrib & 0xff) << 8));
+            cpu_x86_load_seg_cache(env, R_ES, vmsa->vmsa.es.selector,
+                                   vmsa->vmsa.es.base, vmsa->vmsa.es.limit,
+                                   ((vmsa->vmsa.es.attrib & 0xff00) << 12) |
+                                       ((vmsa->vmsa.es.attrib & 0xff) << 8));
+            cpu_x86_load_seg_cache(env, R_FS, vmsa->vmsa.fs.selector,
+                                   vmsa->vmsa.fs.base, vmsa->vmsa.fs.limit,
+                                   ((vmsa->vmsa.fs.attrib & 0xff00) << 12) |
+                                       ((vmsa->vmsa.fs.attrib & 0xff) << 8));
+            cpu_x86_load_seg_cache(env, R_SS, vmsa->vmsa.ss.selector,
+                                   vmsa->vmsa.ss.base, vmsa->vmsa.ss.limit,
+                                   ((vmsa->vmsa.ss.attrib & 0xff00) << 12) |
+                                       ((vmsa->vmsa.ss.attrib & 0xff) << 8));
+
+            env->gdt.base = vmsa->vmsa.gdtr.base;
+            env->gdt.limit = vmsa->vmsa.gdtr.limit;
+
+            env->regs[R_ESP] = vmsa->vmsa.rsp;
+            env->eip = vmsa->vmsa.rip;
+            break;
+        }
     }
+}
 
-    /* Do not update the BSP reset state */
-    if (cpu->cpu_index == 0) {
-        return;
-    }
-
-    x86 = X86_CPU(cpu);
-    env = &x86->env;
-
-    cpu_x86_load_seg_cache(env, R_CS, 0xf000, sev_common->reset_cs, 0xffff,
-                           DESC_P_MASK | DESC_S_MASK | DESC_CS_MASK |
-                           DESC_R_MASK | DESC_A_MASK);
-
-    env->eip = sev_common->reset_ip;
+void sev_es_set_reset_vector(CPUState *cpu)
+{
+    sev_apply_cpu_context(cpu);
 }
 
 int sev_es_save_reset_vector(void *flash_ptr, uint64_t flash_size)
@@ -2063,7 +2147,6 @@ int sev_es_save_reset_vector(void *flash_ptr, uint64_t flash_size)
     CPUState *cpu;
     uint32_t addr;
     int ret;
-    SevCommonState *sev_common = SEV_COMMON(MACHINE(qdev_get_machine())->cgs);
 
     if (!sev_es_enabled()) {
         return 0;
@@ -2077,13 +2160,11 @@ int sev_es_save_reset_vector(void *flash_ptr, uint64_t flash_size)
     }
 
     if (addr) {
-        sev_common->reset_cs = addr & 0xffff0000;
-        sev_common->reset_ip = addr & 0x0000ffff;
-        sev_common->reset_data_valid = true;
-
-        CPU_FOREACH(cpu) {
-            sev_es_set_reset_vector(cpu);
-        }
+        sev_es_set_vmsa(addr);
+    }
+    
+    CPU_FOREACH(cpu) {
+        sev_apply_cpu_context(cpu);
     }
 
     return 0;
