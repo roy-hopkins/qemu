@@ -37,8 +37,10 @@
 #include "qapi/qapi-commands-misc-target.h"
 #include "exec/confidential-guest-support.h"
 #include "hw/i386/pc.h"
+#include "hw/i386/e820_memory_layout.h"
 #include "exec/address-spaces.h"
 #include "qemu/queue.h"
+#include "qemu/cutils.h"
 
 /* hard code sha256 digest size */
 #define HASH_SIZE 32
@@ -235,6 +237,13 @@ typedef struct {
     SnpCpuidFunc entries[SNP_CPUID_FUNCTION_MAXCOUNT];
 } __attribute__((packed)) SnpCpuidInfo;
 
+static int sev_launch_update_data(SevGuestState *sev_guest, uint8_t *addr,
+                                  uint64_t len, Error **errp);
+static int snp_launch_update_data(uint64_t gpa, void *hva, uint32_t len,
+                                  int type, Error **errp);
+static int snp_launch_update_cpuid(uint32_t cpuid_addr, void *hva,
+                                   uint32_t cpuid_len, Error **errp);
+
 static int
 sev_ioctl(int fd, int cmd, void *data, int *error)
 {
@@ -364,6 +373,15 @@ static struct RAMBlockNotifier sev_ram_notifier = {
     .ram_block_removed = sev_ram_block_removed,
 };
 
+static int cgs_check_support(ConfidentialGuestPlatformType platform,
+                             uint16_t platform_version, uint8_t highest_vtl,
+                             uint64_t shared_gpa_boundary)
+{
+    return (((platform == CGS_PLATFORM_SEV_SNP) && sev_snp_enabled()) ||
+            ((platform == CGS_PLATFORM_SEV_ES) && sev_es_enabled()) ||
+            ((platform == CGS_PLATFORM_SEV) && sev_enabled())) ? 1 : 0;
+}
+
 static void sev_apply_cpu_context(CPUState *cpu)
 {
     SevCommonState *sev_common = SEV_COMMON(MACHINE(qdev_get_machine())->cgs);
@@ -441,12 +459,63 @@ static void sev_apply_cpu_context(CPUState *cpu)
             env->eip = launch_vmsa->vmsa.rip;
             env->eflags = launch_vmsa->vmsa.rflags;
 
-            env->pat = launch_vmsa->vmsa.g_pat;
+            if (sev_snp_enabled()) {
+                env->pat = launch_vmsa->vmsa.g_pat;
+            }
             env->xcr0 = launch_vmsa->vmsa.xcr0;
 
             break;
         }
     }
+}
+
+static bool check_vmsa_supported(const struct sev_es_save_area *vmsa)
+{
+    struct sev_es_save_area vmsa_check;
+    /*
+     * Clear all supported fields so we can then check the entire structure
+     * is zero.
+     */
+    memcpy(&vmsa_check, vmsa, sizeof(struct sev_es_save_area));
+    memset(&vmsa_check.es, 0, sizeof(vmsa_check.es));
+    memset(&vmsa_check.cs, 0, sizeof(vmsa_check.cs));
+    memset(&vmsa_check.ss, 0, sizeof(vmsa_check.ss));
+    memset(&vmsa_check.ds, 0, sizeof(vmsa_check.ds));
+    memset(&vmsa_check.fs, 0, sizeof(vmsa_check.fs));
+    memset(&vmsa_check.gs, 0, sizeof(vmsa_check.gs));
+    vmsa_check.efer = 0;
+    vmsa_check.cr0 = 0;
+    vmsa_check.cr3 = 0;
+    vmsa_check.cr4 = 0;
+    vmsa_check.xcr0 = 0;
+    vmsa_check.dr6 = 0;
+    vmsa_check.dr7 = 0;
+    vmsa_check.rax = 0;
+    vmsa_check.rcx = 0;
+    vmsa_check.rdx = 0;
+    vmsa_check.rbx = 0;
+    vmsa_check.rsp = 0;
+    vmsa_check.rbp = 0;
+    vmsa_check.rsi = 0;
+    vmsa_check.rdi = 0;
+    vmsa_check.r8 = 0;
+    vmsa_check.r9 = 0;
+    vmsa_check.r10 = 0;
+    vmsa_check.r11 = 0;
+    vmsa_check.r12 = 0;
+    vmsa_check.r13 = 0;
+    vmsa_check.r14 = 0;
+    vmsa_check.r15 = 0;
+    vmsa_check.rip = 0;
+    vmsa_check.rflags = 0;
+
+    vmsa_check.g_pat = 0;
+    vmsa_check.xcr0 = 0;
+
+    /* TODO: Handle setting of sev_features when KVM supports this. */
+    vmsa_check.sev_features = 0;
+
+    return buffer_is_zero(&vmsa_check, sizeof(vmsa_check));
 }
 
 static int sev_set_cpu_context(uint16_t cpu_index, const void *ctx,
@@ -511,6 +580,107 @@ static int sev_set_cpu_context(uint16_t cpu_index, const void *ctx,
     return 0;
 }
 
+static int cgs_set_guest_state(hwaddr gpa, uint8_t *ptr, uint64_t len,
+                               ConfidentialGuestPageType memory_type,
+                               uint16_t cpu_index, Error **errp)
+{
+    if (!sev_enabled()) {
+        error_setg(errp, "%s: attempt to configure guest memory, but SEV "
+                     "is not enabled", __func__);
+        return -1;
+    }
+
+    switch (memory_type) {
+        case CGS_PAGE_TYPE_NORMAL:
+        case CGS_PAGE_TYPE_ZERO:
+            if (sev_snp_enabled()) {
+                return snp_launch_update_data(gpa, ptr, len, KVM_SEV_SNP_PAGE_TYPE_NORMAL, errp);
+            }
+            return sev_launch_update_data(
+                SEV_GUEST(MACHINE(qdev_get_machine())->cgs), ptr, len, errp);
+
+        case CGS_PAGE_TYPE_VMSA:
+            if (!sev_es_enabled()) {
+                error_setg(errp, "%s: attempt to configure initial VMSA, but SEV-ES "
+                            "is not supported", __func__);
+                return -1;
+            }
+            if (!check_vmsa_supported((const struct sev_es_save_area *)ptr)) {
+                error_setg(errp,
+                        "%s: The VMSA contains fields that are not "
+                        "synchronized with KVM. Continuing would result in "
+                        "either unpredictable guest behavior, or a "
+                        "mismatched launch measurement.",
+                        __func__);
+                return -1;
+            }
+            return sev_set_cpu_context(cpu_index, ptr, len, gpa, errp);
+
+        case CGS_PAGE_TYPE_UNMEASURED:
+            if (sev_snp_enabled()) {
+                return snp_launch_update_data(gpa, ptr, len, KVM_SEV_SNP_PAGE_TYPE_UNMEASURED, errp);
+            }
+            /* No action required if not SEV-SNP */
+            return 0;
+
+        case CGS_PAGE_TYPE_SECRETS:
+            if (!sev_snp_enabled()) {
+                error_setg(errp, "%s: attempt to configure secrets page, but SEV-SNP "
+                            "is not supported", __func__);
+                return -1;
+            }
+            return snp_launch_update_data(gpa, ptr, len, KVM_SEV_SNP_PAGE_TYPE_SECRETS, errp);
+
+        case CGS_PAGE_TYPE_REQUIRED_MEMORY:
+            if (kvm_convert_memory(gpa, len, true) < 0) {
+                error_setg(errp, "%s: failed to configure required memory. gpa: %lX, type: %d",
+                        __func__, gpa, memory_type);
+                return -1;
+            }
+            return 0;
+
+        case CGS_PAGE_TYPE_CPUID:
+            if (!sev_snp_enabled()) {
+                error_setg(errp, "%s: attempt to configure CPUID page, but SEV-SNP "
+                            "is not supported", __func__);
+                return -1;
+            }
+            return snp_launch_update_cpuid(gpa, ptr, len, errp);
+    }
+    error_setg(errp, "%s: failed to update guest. gpa: %lX, type: %d",
+                __func__, gpa, memory_type);
+    return -1;
+}
+
+static int cgs_get_mem_map_entry(int index,
+                                 ConfidentialGuestMemoryMapEntry *entry,
+                                 Error **errp)
+{
+    if ((index < 0) || (index >= e820_get_num_entries())) {
+        return 1;
+    }
+    entry->gpa = e820_table[index].address;
+    entry->size = e820_table[index].length;
+    switch (e820_table[index].type) {
+    case E820_RAM:
+        entry->type = CGS_MEM_RAM;
+        break;
+    case E820_RESERVED:
+        entry->type = CGS_MEM_RESERVED;
+        break;
+    case E820_ACPI:
+        entry->type = CGS_MEM_ACPI;
+        break;
+    case E820_NVS:
+        entry->type = CGS_MEM_NVS;
+        break;
+    case E820_UNUSABLE:
+        entry->type = CGS_MEM_UNUSABLE;
+        break;
+    }
+    return 0;
+}
+
 static char *
 sev_common_get_sev_device(Object *obj, Error **errp)
 {
@@ -552,6 +722,7 @@ static void
 sev_common_instance_init(Object *obj)
 {
     SevCommonState *sev_common = SEV_COMMON(obj);
+    ConfidentialGuestSupportClass *cgs = CONFIDENTIAL_GUEST_SUPPORT_GET_CLASS(obj);
 
     sev_common->sev_device = g_strdup(DEFAULT_SEV_DEVICE);
 
@@ -560,6 +731,11 @@ sev_common_instance_init(Object *obj)
     object_property_add_uint32_ptr(obj, "reduced-phys-bits",
                                    &sev_common->reduced_phys_bits,
                                    OBJ_PROP_FLAG_READWRITE);
+
+    cgs->check_support = cgs_check_support;
+    cgs->set_guest_state = cgs_set_guest_state;
+    cgs->get_mem_map_entry = cgs_get_mem_map_entry;
+
     QTAILQ_INIT(&sev_common->launch_vmsa);
 }
 
@@ -1636,7 +1812,7 @@ sev_snp_cpuid_info_fill(SnpCpuidInfo *snp_cpuid_info,
 }
 
 static int
-snp_launch_update_data(uint64_t gpa, void *hva, uint32_t len, int type)
+snp_launch_update_data(uint64_t gpa, void *hva, uint32_t len, int type, Error **errp)
 {
     SevLaunchUpdateData *data;
 
@@ -1651,8 +1827,8 @@ snp_launch_update_data(uint64_t gpa, void *hva, uint32_t len, int type)
     return 0;
 }
 
-static int
-snp_launch_update_cpuid(uint32_t cpuid_addr, void *hva, uint32_t cpuid_len)
+static int snp_launch_update_cpuid(uint32_t cpuid_addr, void *hva,
+                                   uint32_t cpuid_len, Error **errp)
 {
     KvmCpuidInfo kvm_cpuid_info = {0};
     SnpCpuidInfo snp_cpuid_info;
@@ -1669,20 +1845,21 @@ snp_launch_update_cpuid(uint32_t cpuid_addr, void *hva, uint32_t cpuid_len)
     } while (ret == -E2BIG);
 
     if (ret) {
-        error_report("SEV-SNP: unable to query CPUID values for CPU: '%s'",
+        error_setg(errp, "SEV-SNP: unable to query CPUID values for CPU: '%s'",
                      strerror(-ret));
-        return 1;
+        return -1;
     }
 
     ret = sev_snp_cpuid_info_fill(&snp_cpuid_info, &kvm_cpuid_info);
     if (ret) {
-        error_report("SEV-SNP: failed to generate CPUID table information");
-        return 1;
+        error_setg(errp, "SEV-SNP: failed to generate CPUID table information");
+        return -1;
     }
 
     memcpy(hva, &snp_cpuid_info, sizeof(snp_cpuid_info));
 
-    return snp_launch_update_data(cpuid_addr, hva, cpuid_len, KVM_SEV_SNP_PAGE_TYPE_CPUID);
+    return snp_launch_update_data(cpuid_addr, hva, cpuid_len,
+                                  KVM_SEV_SNP_PAGE_TYPE_CPUID, errp);
 }
 
 static int
@@ -1699,7 +1876,7 @@ snp_launch_update_kernel_hashes(SevSnpGuestState *sev_snp, uint32_t addr,
                sizeof(*sev_snp->kernel_hashes_data));
         type = KVM_SEV_SNP_PAGE_TYPE_NORMAL;
     }
-    return snp_launch_update_data(addr, hva, len, type);
+    return snp_launch_update_data(addr, hva, len, type, &error_fatal);
 }
 
 static int
@@ -1740,12 +1917,13 @@ snp_populate_metadata_pages(SevSnpGuestState *sev_snp, OvmfSevMetadata *metadata
         }
 
         if (type == KVM_SEV_SNP_PAGE_TYPE_CPUID) {
-            ret = snp_launch_update_cpuid(desc->base, hva, desc->len);
+            ret = snp_launch_update_cpuid(desc->base, hva, desc->len, &error_fatal);
         } else if (desc->type == SEV_DESC_TYPE_SNP_KERNEL_HASHES) {
             ret = snp_launch_update_kernel_hashes(sev_snp, desc->base, hva,
                                                   desc->len);
         } else {
-            ret = snp_launch_update_data(desc->base, hva, desc->len, type);
+            ret = snp_launch_update_data(desc->base, hva, desc->len, type,
+                                         &error_fatal);
         }
 
         if (ret) {
@@ -1766,18 +1944,26 @@ sev_snp_launch_finish(SevSnpGuestState *sev_snp)
     struct kvm_sev_snp_launch_finish *finish = &sev_snp->kvm_finish_conf;
 
     /*
-     * To boot the SNP guest, the hypervisor is required to populate the CPUID
-     * and Secrets page before finalizing the launch flow. The location of
-     * the secrets and CPUID page is available through the OVMF metadata GUID.
+     * Populate all the metadata pages if not using an IGVM file. In the case
+     * where an IGVM file is provided it will be used to configure the metadata
+     * pages directly.
      */
-    metadata = pc_system_get_ovmf_sev_metadata_ptr();
-    if (metadata == NULL) {
-        error_report("%s: Failed to locate SEV metadata header\n", __func__);
-        exit(1);
-    }
+    if (!MACHINE(qdev_get_machine())->igvm) {
+        /*
+        * To boot the SNP guest, the hypervisor is required to populate the CPUID
+        * and Secrets page before finalizing the launch flow. The location of
+        * the secrets and CPUID page is available through the OVMF metadata GUID.
+        */
+        metadata = pc_system_get_ovmf_sev_metadata_ptr();
+        if (metadata == NULL) {
+            error_report("%s: Failed to locate SEV metadata header\n",
+                         __func__);
+            exit(1);
+        }
 
-    /* Populate all the metadata pages */
-    snp_populate_metadata_pages(sev_snp, metadata);
+        /* Populate all the metadata pages */
+        snp_populate_metadata_pages(sev_snp, metadata);
+    }
 
     QTAILQ_FOREACH(data, &launch_update, next) {
         ret = sev_snp_launch_update(sev_snp, data);
@@ -1986,7 +2172,7 @@ sev_encrypt_flash(hwaddr gpa, uint8_t *ptr, uint64_t len, Error **errp)
 
         if (sev_snp_enabled()) {
             ret = snp_launch_update_data(gpa, ptr, len,
-                                         KVM_SEV_SNP_PAGE_TYPE_NORMAL);
+                                         KVM_SEV_SNP_PAGE_TYPE_NORMAL, errp);
         } else {
             ret = sev_launch_update_data(SEV_GUEST(sev_common), ptr, len, errp);
         }
