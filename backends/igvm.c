@@ -103,6 +103,8 @@ static int directive_required_memory(QemuIgvm *ctx, const uint8_t *header_data,
                                      Error **errp);
 static int directive_snp_id_block(QemuIgvm *ctx, const uint8_t *header_data,
                                   Error **errp);
+static int initialization_guest_policy(QemuIgvm *ctx, const uint8_t *header_data,
+                                  Error **errp);
 
 struct IGVMHandler {
     uint32_t type;
@@ -120,6 +122,7 @@ static struct IGVMHandler handlers[] = {
     { IGVM_VHT_ENVIRONMENT_INFO_PARAMETER, IGVM_HEADER_SECTION_DIRECTIVE, directive_environment_info },
     { IGVM_VHT_REQUIRED_MEMORY, IGVM_HEADER_SECTION_DIRECTIVE, directive_required_memory },
     { IGVM_VHT_SNP_ID_BLOCK, IGVM_HEADER_SECTION_DIRECTIVE, directive_snp_id_block },
+    { IGVM_VHT_GUEST_POLICY, IGVM_HEADER_SECTION_INITIALIZATION, initialization_guest_policy },
 };
 
 static int handler(QemuIgvm *ctx, uint32_t type, Error **errp)
@@ -684,6 +687,18 @@ static int directive_snp_id_block(QemuIgvm *ctx, const uint8_t *header_data,
                72);
     }
 
+    return 0;
+}
+
+static int initialization_guest_policy(QemuIgvm *ctx,
+                                       const uint8_t *header_data, Error **errp)
+{
+    const IGVM_VHS_GUEST_POLICY *guest =
+        (const IGVM_VHS_GUEST_POLICY *)header_data;
+
+    if (guest->compatibility_mask & ctx->compatibility_mask) {
+        ctx->sev_policy = guest->policy;
+    }
     return 0;
 }
 
