@@ -29,6 +29,33 @@ typedef struct IgvmParameterData {
 } IgvmParameterData;
 
 /*
+ * Some directives are specific individual confidential computing platforms.
+ * Define required types for each of those platforms here.
+ */
+
+/* SEV/SEV-ES/SEV-SNP */
+struct QEMU_PACKED sev_id_block {
+	uint8_t ld[48];
+	uint8_t family_id[16];
+	uint8_t image_id[16];
+	uint32_t version;
+	uint32_t guest_svn;
+	uint64_t policy;
+};
+
+struct QEMU_PACKED sev_id_authentication {
+	uint32_t id_key_alg;
+	uint32_t auth_key_algo;
+	uint8_t reserved[56];
+	uint8_t id_block_sig[512];
+	uint8_t id_key[1028];
+	uint8_t reserved2[60];
+	uint8_t id_key_sig[512];
+	uint8_t author_key[1028];
+	uint8_t reserved3[892];
+};
+
+/*
  * QemuIgvm contains the information required during processing
  * of a single IGVM file.
  */
@@ -38,6 +65,17 @@ typedef struct QemuIgvm {
     uint32_t compatibility_mask;
     unsigned current_header_index;
     QTAILQ_HEAD(, IgvmParameterData) parameter_data;
+    IgvmPlatformType platform_type;
+
+    /*
+     * For SEV platforms, optionally contains the ID block and authentication
+     * that should be verified by the guest.
+     */
+    struct sev_id_block *id_block;
+    struct sev_id_authentication *id_auth;
+
+    /* Define the guest policy for SEV guests */
+    uint64_t sev_policy;
 
     /* These variables keep track of contiguous page regions */
     IGVM_VHS_PAGE_DATA region_prev_page_data;
@@ -63,36 +101,40 @@ static int directive_environment_info(QemuIgvm *ctx, const uint8_t *header_data,
                                       Error **errp);
 static int directive_required_memory(QemuIgvm *ctx, const uint8_t *header_data,
                                      Error **errp);
+static int directive_snp_id_block(QemuIgvm *ctx, const uint8_t *header_data,
+                                  Error **errp);
 
-struct IGVMDirectiveHandler {
+struct IGVMHandler {
     uint32_t type;
+    uint32_t section;
     int (*handler)(QemuIgvm *ctx, const uint8_t *header_data, Error **errp);
 };
 
-static const struct IGVMDirectiveHandler directive_handlers[] = {
-    { IGVM_VHT_PAGE_DATA, directive_page_data },
-    { IGVM_VHT_VP_CONTEXT, directive_vp_context },
-    { IGVM_VHT_PARAMETER_AREA, directive_parameter_area },
-    { IGVM_VHT_PARAMETER_INSERT, directive_parameter_insert },
-    { IGVM_VHT_MEMORY_MAP, directive_memory_map },
-    { IGVM_VHT_VP_COUNT_PARAMETER, directive_vp_count },
-    { IGVM_VHT_ENVIRONMENT_INFO_PARAMETER, directive_environment_info },
-    { IGVM_VHT_REQUIRED_MEMORY, directive_required_memory },
+static struct IGVMHandler handlers[] = {
+    { IGVM_VHT_PAGE_DATA, IGVM_HEADER_SECTION_DIRECTIVE, directive_page_data },
+    { IGVM_VHT_VP_CONTEXT, IGVM_HEADER_SECTION_DIRECTIVE, directive_vp_context },
+    { IGVM_VHT_PARAMETER_AREA, IGVM_HEADER_SECTION_DIRECTIVE, directive_parameter_area },
+    { IGVM_VHT_PARAMETER_INSERT, IGVM_HEADER_SECTION_DIRECTIVE, directive_parameter_insert },
+    { IGVM_VHT_MEMORY_MAP, IGVM_HEADER_SECTION_DIRECTIVE, directive_memory_map },
+    { IGVM_VHT_VP_COUNT_PARAMETER, IGVM_HEADER_SECTION_DIRECTIVE, directive_vp_count },
+    { IGVM_VHT_ENVIRONMENT_INFO_PARAMETER, IGVM_HEADER_SECTION_DIRECTIVE, directive_environment_info },
+    { IGVM_VHT_REQUIRED_MEMORY, IGVM_HEADER_SECTION_DIRECTIVE, directive_required_memory },
+    { IGVM_VHT_SNP_ID_BLOCK, IGVM_HEADER_SECTION_DIRECTIVE, directive_snp_id_block },
 };
 
-static int directive(QemuIgvm *ctx, uint32_t type, Error **errp)
+static int handler(QemuIgvm *ctx, uint32_t type, Error **errp)
 {
     size_t handler;
     IgvmHandle header_handle;
     const uint8_t *header_data;
     int result;
 
-    for (handler = 0; handler < G_N_ELEMENTS(directive_handlers); handler++) {
-        if (directive_handlers[handler].type != type) {
+    for (handler = 0; handler < G_N_ELEMENTS(handlers); handler++) {
+        if (handlers[handler].type != type) {
             continue;
         }
         header_handle = igvm_get_header(ctx->file,
-                                        IGVM_HEADER_SECTION_DIRECTIVE,
+                                        handlers[handler].section,
                                         ctx->current_header_index);
         if (header_handle < 0) {
             error_setg(
@@ -103,12 +145,12 @@ static int directive(QemuIgvm *ctx, uint32_t type, Error **errp)
         }
         header_data = igvm_get_buffer(ctx->file, header_handle) +
                       sizeof(IGVM_VHS_VARIABLE_HEADER);
-        result = directive_handlers[handler].handler(ctx, header_data, errp);
+        result = handlers[handler].handler(ctx, header_data, errp);
         igvm_free_buffer(ctx->file, header_handle);
         return result;
     }
     error_setg(errp,
-               "IGVM: Unknown directive type encountered when processing file: "
+               "IGVM: Unknown header type encountered when processing file: "
                "(type 0x%X)",
                type);
     return -1;
@@ -595,7 +637,57 @@ static int directive_required_memory(QemuIgvm *ctx, const uint8_t *header_data,
     return 0;
 }
 
-static uint32_t supported_platform_compat_mask(QemuIgvm *ctx, Error **errp)
+static int directive_snp_id_block(QemuIgvm *ctx, const uint8_t *header_data,
+                                  Error **errp)
+{
+    const IGVM_VHS_SNP_ID_BLOCK *igvm_id =
+        (const IGVM_VHS_SNP_ID_BLOCK *)header_data;
+
+    if (ctx->compatibility_mask & igvm_id->compatibility_mask) {
+        if (ctx->id_block) {
+            error_setg(errp, "IGVM: Multiple ID blocks encountered "
+                             "in IGVM file.");
+            return -1;
+        }
+        ctx->id_block = g_malloc0(sizeof(struct sev_id_block));
+        ctx->id_auth = g_malloc0(sizeof(struct sev_id_authentication));
+
+        memcpy(ctx->id_block->family_id, igvm_id->family_id,
+               sizeof(ctx->id_block->family_id));
+        memcpy(ctx->id_block->image_id, igvm_id->image_id,
+               sizeof(ctx->id_block->image_id));
+        ctx->id_block->guest_svn = igvm_id->guest_svn;
+        ctx->id_block->version = 1;
+        memcpy(ctx->id_block->ld, igvm_id->ld, sizeof(ctx->id_block->ld));
+
+        ctx->id_auth->id_key_alg = igvm_id->id_key_algorithm;
+        memcpy(ctx->id_auth->id_block_sig, &igvm_id->id_key_signature,
+               sizeof(igvm_id->id_key_signature));
+
+        ctx->id_auth->auth_key_algo = igvm_id->author_key_algorithm;
+        memcpy(ctx->id_auth->id_key_sig, &igvm_id->author_key_signature,
+               sizeof(igvm_id->author_key_signature));
+
+        /*
+         * SEV and IGVM public key structure population are slightly different.
+         * See SEV Secure Nested Paging Firmware ABI Specification, Chapter 10.
+         */
+        *((uint32_t *)ctx->id_auth->id_key) = igvm_id->id_public_key.curve;
+        memcpy(&ctx->id_auth->id_key[4], &igvm_id->id_public_key.qx, 72);
+        memcpy(&ctx->id_auth->id_key[76], &igvm_id->id_public_key.qy, 72);
+
+        *((uint32_t *)ctx->id_auth->author_key) =
+            igvm_id->author_public_key.curve;
+        memcpy(&ctx->id_auth->author_key[4], &igvm_id->author_public_key.qx,
+               72);
+        memcpy(&ctx->id_auth->author_key[76], &igvm_id->author_public_key.qy,
+               72);
+    }
+
+    return 0;
+}
+
+static int supported_platform_compat_mask(QemuIgvm *ctx, Error **errp)
 {
     int32_t header_count;
     unsigned header_index;
@@ -611,7 +703,7 @@ static uint32_t supported_platform_compat_mask(QemuIgvm *ctx, Error **errp)
         error_setg(errp,
                    "Invalid platform header count in IGVM file. Error code: %X",
                    header_count);
-        return 0;
+        return -1;
     }
 
     for (header_index = 0; header_index < (unsigned)header_count;
@@ -626,7 +718,7 @@ static uint32_t supported_platform_compat_mask(QemuIgvm *ctx, Error **errp)
                            "Invalid platform header in IGVM file. "
                            "Index: %d, Error code: %X",
                            header_index, header_handle);
-                return 0;
+                return -1;
             }
             platform =
                 (IGVM_VHS_SUPPORTED_PLATFORM *)(igvm_get_buffer(ctx->file,
@@ -661,21 +753,42 @@ static uint32_t supported_platform_compat_mask(QemuIgvm *ctx, Error **errp)
         }
     }
     /* Choose the strongest supported isolation technology */
-    compatibility_mask = (compatibility_mask_sev != 0) ?
-                             compatibility_mask_sev :
-                             compatibility_mask;
-    compatibility_mask = (compatibility_mask_sev_es != 0) ?
-                             compatibility_mask_sev_es :
-                             compatibility_mask;
-    compatibility_mask = (compatibility_mask_sev_snp != 0) ?
-                             compatibility_mask_sev_snp :
-                             compatibility_mask;
-    if (compatibility_mask == 0) {
+    if (compatibility_mask_sev_snp != 0) {
+        ctx->compatibility_mask = compatibility_mask_sev_snp;
+        ctx->platform_type = IGVM_PLATFORM_TYPE_SEV_SNP;
+    } else if (compatibility_mask_sev_es != 0) {
+        ctx->compatibility_mask = compatibility_mask_sev_es;
+        ctx->platform_type = IGVM_PLATFORM_TYPE_SEV_ES;
+    } else if (compatibility_mask_sev != 0) {
+        ctx->compatibility_mask = compatibility_mask_sev;
+        ctx->platform_type = IGVM_PLATFORM_TYPE_SEV;
+    } else if (compatibility_mask != 0) {
+        ctx->compatibility_mask = compatibility_mask;
+        ctx->platform_type = IGVM_PLATFORM_TYPE_NATIVE;
+    } else {
         error_setg(
             errp,
             "IGVM file does not describe a compatible supported platform");
+        return -1;
     }
-    return compatibility_mask;
+    return 0;
+}
+
+static int handle_policy(QemuIgvm *ctx, Error **errp)
+{
+    if (ctx->platform_type == IGVM_PLATFORM_TYPE_SEV_SNP) {
+        int id_block_len = 0;
+        int id_auth_len = 0;
+        if (ctx->id_block) {
+            ctx->id_block->policy = ctx->sev_policy;
+            id_block_len = sizeof(struct sev_id_block);
+            id_auth_len = sizeof(struct sev_id_authentication);
+        }
+        return ctx->cgs->set_guest_policy(GUEST_POLICY_SEV, ctx->sev_policy,
+                                          ctx->id_block, id_block_len,
+                                          ctx->id_auth, id_auth_len, errp);
+    }
+    return 0;
 }
 
 static IgvmHandle igvm_file_init(char *filename, Error **errp)
@@ -723,8 +836,7 @@ int igvm_process_file(IgvmCfgState *cfg, ConfidentialGuestSupport *cgs,
      * Check that the IGVM file provides configuration for the current
      * platform
      */
-    ctx.compatibility_mask = supported_platform_compat_mask(&ctx, errp);
-    if (ctx.compatibility_mask == 0) {
+    if (supported_platform_compat_mask(&ctx, errp) < 0) {
         return -1;
     }
 
@@ -743,7 +855,26 @@ int igvm_process_file(IgvmCfgState *cfg, ConfidentialGuestSupport *cgs,
          ctx.current_header_index++) {
         IgvmVariableHeaderType type = igvm_get_header_type(
             ctx.file, IGVM_HEADER_SECTION_DIRECTIVE, ctx.current_header_index);
-        if (directive(&ctx, type, errp) < 0) {
+        if (handler(&ctx, type, errp) < 0) {
+            goto cleanup;
+        }
+    }
+
+    header_count = igvm_header_count(ctx.file, IGVM_HEADER_SECTION_INITIALIZATION);
+    if (header_count < 0) {
+        error_setg(
+            errp, "Invalid initialization header count in IGVM file. Error code: %X",
+            header_count);
+        return -1;
+    }
+
+    for (ctx.current_header_index = 0;
+         ctx.current_header_index < (unsigned)header_count;
+         ctx.current_header_index++) {
+        IgvmVariableHeaderType type =
+            igvm_get_header_type(ctx.file, IGVM_HEADER_SECTION_INITIALIZATION,
+                                 ctx.current_header_index);
+        if (handler(&ctx, type, errp) < 0) {
             goto cleanup;
         }
     }
@@ -755,12 +886,18 @@ int igvm_process_file(IgvmCfgState *cfg, ConfidentialGuestSupport *cgs,
      */
     retval = process_mem_page(&ctx, NULL, errp);
 
+    if (retval == 0) {
+        retval = handle_policy(&ctx, errp);
+    }
+
 cleanup:
     QTAILQ_FOREACH(parameter, &ctx.parameter_data, next)
     {
         g_free(parameter->data);
         parameter->data = NULL;
     }
+    g_free(ctx.id_block);
+    g_free(ctx.id_auth);
 
     return retval;
 }
