@@ -19,6 +19,7 @@
 #include "hw/core/cpu.h"
 
 #include <igvm/igvm.h>
+#include <igvm/igvm_defs.h>
 
 typedef struct IgvmParameterData {
     QTAILQ_ENTRY(IgvmParameterData) next;
@@ -602,6 +603,7 @@ static uint32_t supported_platform_compat_mask(QemuIgvm *ctx, Error **errp)
     IGVM_VHS_SUPPORTED_PLATFORM *platform;
     uint32_t compatibility_mask_sev = 0;
     uint32_t compatibility_mask_sev_es = 0;
+    uint32_t compatibility_mask_sev_snp = 0;
     uint32_t compatibility_mask = 0;
 
     header_count = igvm_header_count(ctx->file, IGVM_HEADER_SECTION_PLATFORM);
@@ -638,20 +640,22 @@ static uint32_t supported_platform_compat_mask(QemuIgvm *ctx, Error **errp)
                         platform->highest_vtl, platform->shared_gpa_boundary)) {
                     compatibility_mask_sev_es = platform->compatibility_mask;
                 }
-            }
-            if ((platform->platform_type == IGVM_PLATFORM_TYPE_SEV) &&
+            } else if ((platform->platform_type == IGVM_PLATFORM_TYPE_SEV) &&
                 ctx->cgs) {
                 if (ctx->cgs->check_support(
                         CGS_PLATFORM_SEV, platform->platform_version,
                         platform->highest_vtl, platform->shared_gpa_boundary)) {
                     compatibility_mask_sev = platform->compatibility_mask;
                 }
+            } else if ((platform->platform_type == IGVM_PLATFORM_TYPE_SEV_SNP) &&
+                ctx->cgs) {
+                if (ctx->cgs->check_support(
+                        CGS_PLATFORM_SEV_SNP, platform->platform_version,
+                        platform->highest_vtl, platform->shared_gpa_boundary)) {
+                    compatibility_mask_sev_snp = platform->compatibility_mask;
+                }
             } else if (platform->platform_type == IGVM_PLATFORM_TYPE_NATIVE) {
                 compatibility_mask = platform->compatibility_mask;
-                /*
-                 * Continue looking for other platforms as we prefer a platform that supports
-                 * an isolation technology rather than the native platform.
-                 */
             }
             igvm_free_buffer(ctx->file, header_handle);
         }
@@ -662,6 +666,9 @@ static uint32_t supported_platform_compat_mask(QemuIgvm *ctx, Error **errp)
                              compatibility_mask;
     compatibility_mask = (compatibility_mask_sev_es != 0) ?
                              compatibility_mask_sev_es :
+                             compatibility_mask;
+    compatibility_mask = (compatibility_mask_sev_snp != 0) ?
+                             compatibility_mask_sev_snp :
                              compatibility_mask;
     if (compatibility_mask == 0) {
         error_setg(
