@@ -194,6 +194,7 @@ typedef struct SevLaunchUpdateData {
     hwaddr gpa;
     void *hva;
     size_t len;
+    uint16_t flags;
     int type;
 } SevLaunchUpdateData;
 
@@ -521,90 +522,6 @@ static int check_sev_features(SevCommonState *sev_common, uint64_t sev_features,
                    "%s: VMSA contains unsupported sev_features: %lX, "
                    "supported features: %lX",
                    __func__, sev_features, sev_common->supported_sev_features);
-        return -1;
-    }
-    return 0;
-}
-
-static int check_vmsa_supported(SevCommonState *sev_common, hwaddr gpa,
-                                const struct sev_es_save_area *vmsa,
-                                Error **errp)
-{
-    struct sev_es_save_area vmsa_check;
-
-    /*
-     * KVM always populates the VMSA at a fixed GPA which cannot be modified
-     * from userspace. Specifying a different GPA will not prevent the guest
-     * from starting but will cause the launch measurement to be different
-     * from expected. Therefore check that the provided GPA matches the KVM
-     * hardcoded value.
-     */
-    if (gpa != KVM_VMSA_GPA) {
-        error_setg(errp,
-                "%s: The VMSA GPA must be %lX but is specified as %lX",
-                __func__, KVM_VMSA_GPA, gpa);
-        return -1;
-    }
-
-    /*
-     * Clear all supported fields so we can then check the entire structure
-     * is zero.
-     */
-    memcpy(&vmsa_check, vmsa, sizeof(struct sev_es_save_area));
-    memset(&vmsa_check.es, 0, sizeof(vmsa_check.es));
-    memset(&vmsa_check.cs, 0, sizeof(vmsa_check.cs));
-    memset(&vmsa_check.ss, 0, sizeof(vmsa_check.ss));
-    memset(&vmsa_check.ds, 0, sizeof(vmsa_check.ds));
-    memset(&vmsa_check.fs, 0, sizeof(vmsa_check.fs));
-    memset(&vmsa_check.gs, 0, sizeof(vmsa_check.gs));
-    memset(&vmsa_check.gdtr, 0, sizeof(vmsa_check.gdtr));
-    memset(&vmsa_check.idtr, 0, sizeof(vmsa_check.idtr));
-    memset(&vmsa_check.ldtr, 0, sizeof(vmsa_check.ldtr));
-    memset(&vmsa_check.tr, 0, sizeof(vmsa_check.tr));
-    vmsa_check.efer = 0;
-    vmsa_check.cr0 = 0;
-    vmsa_check.cr3 = 0;
-    vmsa_check.cr4 = 0;
-    vmsa_check.xcr0 = 0;
-    vmsa_check.dr6 = 0;
-    vmsa_check.dr7 = 0;
-    vmsa_check.rax = 0;
-    vmsa_check.rcx = 0;
-    vmsa_check.rdx = 0;
-    vmsa_check.rbx = 0;
-    vmsa_check.rsp = 0;
-    vmsa_check.rbp = 0;
-    vmsa_check.rsi = 0;
-    vmsa_check.rdi = 0;
-    vmsa_check.r8 = 0;
-    vmsa_check.r9 = 0;
-    vmsa_check.r10 = 0;
-    vmsa_check.r11 = 0;
-    vmsa_check.r12 = 0;
-    vmsa_check.r13 = 0;
-    vmsa_check.r14 = 0;
-    vmsa_check.r15 = 0;
-    vmsa_check.rip = 0;
-    vmsa_check.rflags = 0;
-
-    vmsa_check.g_pat = 0;
-    vmsa_check.xcr0 = 0;
-
-    vmsa_check.x87_fcw = 0;
-    vmsa_check.mxcsr = 0;
-
-    if (check_sev_features(sev_common, vmsa_check.sev_features, errp) < 0) {
-        return -1;
-    }
-    vmsa_check.sev_features = 0;
-
-    if (!buffer_is_zero(&vmsa_check, sizeof(vmsa_check))) {
-        error_setg(errp,
-                "%s: The VMSA contains fields that are not "
-                "synchronized with KVM. Continuing would result in "
-                "either unpredictable guest behavior, or a "
-                "mismatched launch measurement.",
-                __func__);
         return -1;
     }
     return 0;
@@ -1170,6 +1087,7 @@ snp_page_type_to_str(int type)
 {
     switch (type) {
     case KVM_SEV_SNP_PAGE_TYPE_NORMAL: return "Normal";
+    case KVM_SEV_SNP_PAGE_TYPE_VMSA: return "VMSA";
     case KVM_SEV_SNP_PAGE_TYPE_ZERO: return "Zero";
     case KVM_SEV_SNP_PAGE_TYPE_UNMEASURED: return "Unmeasured";
     case KVM_SEV_SNP_PAGE_TYPE_SECRETS: return "Secrets";
@@ -1202,6 +1120,7 @@ sev_snp_launch_update(SevSnpGuestState *sev_snp_guest,
     update.gfn_start = data->gpa >> TARGET_PAGE_BITS;
     update.len = data->len;
     update.type = data->type;
+    update.flags = data->flags;
 
     /*
      * KVM_SEV_SNP_LAUNCH_UPDATE requires that GPA ranges have the private
@@ -1406,7 +1325,7 @@ sev_launch_finish(SevCommonState *sev_common)
 }
 
 static int snp_launch_update_data(uint64_t gpa, void *hva, size_t len,
-                                  int type, Error **errp)
+                                  int type, uint16_t flags, Error **errp)
 {
     SevLaunchUpdateData *data;
 
@@ -1415,6 +1334,7 @@ static int snp_launch_update_data(uint64_t gpa, void *hva, size_t len,
     data->hva = hva;
     data->len = len;
     data->type = type;
+    data->flags = flags;
 
     QTAILQ_INSERT_TAIL(&launch_update, data, next);
 
@@ -1425,7 +1345,7 @@ static int sev_snp_launch_update_data(SevCommonState *sev_common, hwaddr gpa,
                                       uint8_t *ptr, size_t len, Error **errp)
 {
     return snp_launch_update_data(gpa, ptr, len,
-                                     KVM_SEV_SNP_PAGE_TYPE_NORMAL, errp);
+                                     KVM_SEV_SNP_PAGE_TYPE_NORMAL, 0, errp);
 }
 
 static int
@@ -1509,7 +1429,7 @@ static int snp_launch_update_cpuid(uint32_t cpuid_addr, void *hva,
     memcpy(hva, &snp_cpuid_info, sizeof(snp_cpuid_info));
 
     return snp_launch_update_data(cpuid_addr, hva, cpuid_len,
-                                  KVM_SEV_SNP_PAGE_TYPE_CPUID, errp);
+                                  KVM_SEV_SNP_PAGE_TYPE_CPUID, 0, errp);
 }
 
 static int snp_launch_update_kernel_hashes(SevSnpGuestState *sev_snp,
@@ -1526,7 +1446,7 @@ static int snp_launch_update_kernel_hashes(SevSnpGuestState *sev_snp,
                sizeof(*sev_snp->kernel_hashes_data));
         type = KVM_SEV_SNP_PAGE_TYPE_NORMAL;
     }
-    return snp_launch_update_data(addr, hva, len, type, errp);
+    return snp_launch_update_data(addr, hva, len, type, 0, errp);
 }
 
 static int
@@ -1571,7 +1491,7 @@ snp_populate_metadata_pages(SevSnpGuestState *sev_snp,
                                                   desc->len, &error_fatal);
         } else {
             ret = snp_launch_update_data(desc->base, hva, desc->len, type,
-                                         &error_fatal);
+                                         0, &error_fatal);
         }
 
         if (ret) {
@@ -2468,7 +2388,8 @@ static int cgs_set_guest_state(hwaddr gpa, uint8_t *ptr, uint64_t len,
     case CGS_PAGE_TYPE_ZERO:
         return klass->launch_update_data(sev_common, gpa, ptr, len, errp);
 
-    case CGS_PAGE_TYPE_VMSA:
+    case CGS_PAGE_TYPE_VMSA: {
+        const struct sev_es_save_area * sa = (const struct sev_es_save_area *)ptr;
         if (!sev_es_enabled()) {
             error_setg(errp,
                        "%s: attempt to configure initial VMSA, but SEV-ES "
@@ -2476,17 +2397,18 @@ static int cgs_set_guest_state(hwaddr gpa, uint8_t *ptr, uint64_t len,
                        __func__);
             return -1;
         }
-        if (check_vmsa_supported(sev_common, gpa,
-                                 (const struct sev_es_save_area *)ptr,
-                                 errp) < 0) {
+        if (check_sev_features(sev_common, sa->sev_features, errp) < 0) {
             return -1;
         }
-        return sev_set_cpu_context(cpu_index, ptr, len, gpa, errp);
+
+        return snp_launch_update_data(
+                gpa, ptr, len, KVM_SEV_SNP_PAGE_TYPE_VMSA, cpu_index, errp);
+    }
 
     case CGS_PAGE_TYPE_UNMEASURED:
         if (sev_snp_enabled()) {
             return snp_launch_update_data(
-                gpa, ptr, len, KVM_SEV_SNP_PAGE_TYPE_UNMEASURED, errp);
+                gpa, ptr, len, KVM_SEV_SNP_PAGE_TYPE_UNMEASURED, 0, errp);
         }
         /* No action required if not SEV-SNP */
         return 0;
@@ -2500,7 +2422,7 @@ static int cgs_set_guest_state(hwaddr gpa, uint8_t *ptr, uint64_t len,
             return -1;
         }
         return snp_launch_update_data(gpa, ptr, len,
-                                      KVM_SEV_SNP_PAGE_TYPE_SECRETS, errp);
+                                      KVM_SEV_SNP_PAGE_TYPE_SECRETS, 0, errp);
 
     case CGS_PAGE_TYPE_REQUIRED_MEMORY:
         if (kvm_convert_memory(gpa, len, true) < 0) {
